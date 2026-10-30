@@ -1,0 +1,111 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP32Servo.h>
+#include <WString.h>
+#include <iostream>
+#include <sstream>
+#include <vector>
+
+struct ServoPins {
+    Servo servo;
+    int servoPin;
+    String servoName;
+    int initialPosition;    
+};
+
+std::vector<ServoPins> servoPins = {
+    {Servo(), 22, "Base", 90},
+    {Servo(), 21, "Shoulder", 90},
+    {Servo(), 19, "Elbow", 20},
+    {Servo(), 18, "Gripper", 130}
+};
+
+const char* ssid = "RobotArm_AP";
+const char* password = "password123";
+const int port = 80;
+
+AsyncWebServer server(port);
+AsyncWebSocket wsRobotArmInput("/RobotArmInput");
+
+void writeServoValues(const String& key, int value) {
+    for (size_t i = 0; i < servoPins.size(); i++) {
+        if (servoPins[i].servoName == key) {
+            int constrainedValue = constrain(value, 0, 180);
+            servoPins[i].servo.write(constrainedValue);
+            Serial.printf("%s (GPIO %d) set to: %d\n", key.c_str(), servoPins[i].servoPin, constrainedValue);
+            return;
+        }
+    }
+}
+
+void onRobotArmInputWebSocketEvent(
+    AsyncWebSocket *server, 
+    AsyncWebSocketClient *client, 
+    AwsEventType type,
+    void *arg, 
+    uint8_t *data, 
+    size_t len) {
+        
+    switch (type) {
+        case WS_EVT_CONNECT:
+            Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+            break;
+        case WS_EVT_DISCONNECT:
+            Serial.printf("WebSocket client #%u disconnected\n", client->id());
+            break;
+        case WS_EVT_DATA:
+            if (((AwsFrameInfo*)arg)->final && ((AwsFrameInfo*)arg)->index == 0 && ((AwsFrameInfo*)arg)->opcode == WS_TEXT) {
+                std::string myData = "";
+                myData.assign((char *)data, len);
+                
+                String dataStr = String(myData.c_str());
+                int commaIndex = dataStr.indexOf(',');
+                
+                if (commaIndex != -1) {
+                    String key = dataStr.substring(0, commaIndex);
+                    String valueStr = dataStr.substring(commaIndex + 1);
+                    int value = valueStr.toInt();
+                    
+                    writeServoValues(key, value);
+                }
+            }
+            break;
+        case WS_EVT_PONG:
+        case WS_EVT_ERROR:
+        default:
+            break;
+    }
+}
+
+void setUpPinModes() {
+    for (size_t i = 0; i < servoPins.size(); i++) {
+        ESP32PWM::allocateTimer(i); 
+        servoPins[i].servo.attach(servoPins[i].servoPin);
+        servoPins[i].servo.write(servoPins[i].initialPosition);      
+        Serial.printf("Setup: %s attached to GPIO %d at %d degrees.\n", 
+            servoPins[i].servoName.c_str(), 
+            servoPins[i].servoPin, 
+            servoPins[i].initialPosition);
+    }
+}
+
+void setup(void) {
+    Serial.begin(115200);
+    setUpPinModes();
+
+    WiFi.softAP(ssid, password);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.printf("AP SSID: %s | IP: %s\n", ssid, IP.toString().c_str());
+
+    wsRobotArmInput.onEvent(onRobotArmInputWebSocketEvent);
+    server.addHandler(&wsRobotArmInput);
+    server.begin();
+    Serial.println("WebSocket Server Started");
+}
+
+void loop() {
+    wsRobotArmInput.cleanupClients();    
+    delay(1);
+}

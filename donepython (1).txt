@@ -1,0 +1,194 @@
+import cv2
+import mediapipe as mp
+import asyncio
+import websockets
+import math
+
+ESP32_IP = "192.168.4.1"
+WS_URL = f"ws://{ESP32_IP}/RobotArmInput"
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+mp_draw = mp.solutions.drawing_utils
+
+SERVO_LIMITS = {
+    "Base": {"min": 0, "max": 180},
+    "Shoulder": {"min": 0, "max": 100},
+    "Elbow": {"min": 0, "max": 100},
+    "Gripper": {"min": 120, "max": 140}
+}
+
+servo_values = {
+    "Base": 90,
+    "Shoulder": 50,
+    "Elbow": 50,
+    "Gripper": 130
+}
+
+PINCH_THRESHOLD = 30
+
+control_areas = {
+    "Base": (30, 75, 25),
+    "Shoulder": (45, 75, 25),
+    "Elbow": (60, 75, 25),
+    "Gripper": (75, 75, 25)
+}
+SLIDER_LENGTH_NORM = 50
+SLIDER_WIDTH = 70
+THUMB_RADIUS = 15
+SLIDER_LINE_THICKNESS = 6
+
+
+async def send_servo_value(websocket, key, value):
+    if websocket and websocket.state.name == 'OPEN':
+        try:
+            message = f"{key},{value}"
+            await websocket.send(message)
+        except Exception:
+            pass
+
+
+async def hand_controller():
+    global servo_values
+    websocket = None
+    try:
+        timeout_duration = 3
+        for attempt in range(5):
+            try:
+                websocket = await asyncio.wait_for(websockets.connect(WS_URL), timeout=timeout_duration)
+                print(f"Connected to ESP32 at {WS_URL}")
+                break
+            except asyncio.TimeoutError:
+                print(f"Connection attempt {attempt + 1} timed out. Retrying...")
+                await asyncio.sleep(2)
+            except (ConnectionRefusedError, websockets.exceptions.InvalidURI) as e:
+                print(f"Connection attempt {attempt + 1} failed: {e}. Retrying...")
+                await asyncio.sleep(2)
+
+        if not websocket:
+            print("Failed to connect to WebSocket.")
+            return
+
+    except Exception as e:
+        print(f"Error during WebSocket connection: {e}")
+        return
+
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    frame_width = 640
+    frame_height = 480
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
+    if not cap.isOpened():
+        print("Cannot open camera.")
+        if websocket:
+            await websocket.close()
+        return
+
+    def draw_control_areas(image, active_servos):
+        h, w, c = image.shape
+        for name, (x_norm, y_start_norm, y_end_norm) in control_areas.items():
+            center_x = int(x_norm / 100 * w)
+            y_start = int(y_start_norm / 100 * h)
+            y_end = int(y_end_norm / 100 * h)
+
+            min_a = SERVO_LIMITS[name]["min"]
+            max_a = SERVO_LIMITS[name]["max"]
+            range_a = max_a - min_a
+
+            line_color = (0, 255, 0) if name in active_servos else (100, 100, 100)
+            cv2.line(image, (center_x, y_start), (center_x, y_end), line_color, SLIDER_LINE_THICKNESS)
+
+            current_value = servo_values[name]
+            norm_value = (current_value - min_a) / range_a
+            y_offset_norm = norm_value * SLIDER_LENGTH_NORM
+            y_thumb = y_start - int(y_offset_norm / 100 * h)
+
+            thumb_color = (0, 255, 0) if name in active_servos else (255, 0, 0)
+            cv2.circle(image, (center_x, y_thumb), THUMB_RADIUS, thumb_color, -1)
+
+            cv2.putText(image, name, (center_x - 30, y_end - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            value_color = (0, 255, 0) if name in active_servos else (0, 0, 255)
+            cv2.putText(image, str(current_value), (center_x - 30, y_start + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, value_color, 2)
+
+        return image
+
+    for key, value in servo_values.items():
+        await send_servo_value(websocket, key, value)
+
+    while cap.isOpened():
+        success, image = cap.read()
+        if not success:
+            await asyncio.sleep(0.01)
+            continue
+
+        image = cv2.flip(image, 1)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = hands.process(image_rgb)
+        currently_active_servos = set()
+
+        if results.multi_hand_landmarks:
+            h, w, c = image.shape
+
+            for hand_landmarks in results.multi_hand_landmarks:
+                thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+                index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+
+                thumb_x, thumb_y = int(thumb_tip.x * w), int(thumb_tip.y * h)
+                index_x, index_y = int(index_tip.x * w), int(index_tip.y * h)
+
+                distance = math.hypot(thumb_x - index_x, thumb_y - index_y)
+                is_pinching = distance < PINCH_THRESHOLD
+
+                pinch_center_x = (thumb_x + index_x) // 2
+                pinch_center_y = (thumb_y + index_y) // 2
+
+                pinch_color = (0, 255, 255) if is_pinching else (255, 165, 0)
+                cv2.circle(image, (pinch_center_x, pinch_center_y), 10, pinch_color, -1)
+
+                if is_pinching:
+                    for name, (x_norm, y_start_norm, y_end_norm) in control_areas.items():
+                        center_x = int(x_norm / 100 * w)
+                        y_start = int(y_start_norm / 100 * h)
+                        y_end = int(y_end_norm / 100 * h)
+
+                        if (center_x - SLIDER_WIDTH // 2 < pinch_center_x < center_x + SLIDER_WIDTH // 2 and
+                                y_end <= pinch_center_y <= y_start):
+
+                            currently_active_servos.add(name)
+                            min_a = SERVO_LIMITS[name]["min"]
+                            max_a = SERVO_LIMITS[name]["max"]
+                            range_a = max_a - min_a
+
+                            current_y = max(y_end, min(y_start, pinch_center_y))
+                            y_range_pixels = y_start - y_end
+                            y_pinch_offset = y_start - current_y
+
+                            norm_value = y_pinch_offset / y_range_pixels
+                            new_value = int(norm_value * range_a + min_a)
+                            new_value = max(min_a, min(max_a, new_value))
+
+                            if new_value != servo_values[name]:
+                                servo_values[name] = new_value
+                                await send_servo_value(websocket, name, new_value)
+
+        image = draw_control_areas(image, currently_active_servos)
+        cv2.imshow('Hand Gesture Robot Arm Control', image)
+
+        if cv2.waitKey(5) & 0xFF == ord('q'):
+            break
+
+        await asyncio.sleep(0.01)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if websocket:
+        await websocket.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(hand_controller())
