@@ -117,7 +117,7 @@ https://github.com/user-attachments/assets/f1f4b809-8819-4cd5-a519-aa21600221fd
 ### 1. Python Client Setup
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/gesture-controlled-4dof-robot-arm.git
+git clone https://github.com/Phuc41/4dof-robot-arm-webcam.git
 cd gesture-controlled-4dof-robot-arm/software_python
 
 # Create and activate virtual environment
